@@ -48,7 +48,7 @@ def landing_dynamics():
 
 
 def base_landing_problem():
-    opti, T, x, u, p = collocate(landing_dynamics(), 10, 3)
+    opti, T, x, u, p = collocate(landing_dynamics(), 20, 3)
 
     r = x[:, 0:3]
     v = x[:, 3:6]
@@ -128,7 +128,7 @@ def min_fuel_landing_problem():
     return opti, T, x, u, p
 
 
-def set_params(opti: ca.Opti, T: ca.MX, p: ca.MX, tf: float):
+def set_params(opti: ca.Opti, T: ca.MX, p: ca.MX, tf: float, rf=None):
     q = p[0:3]
     w = p[3:6]
     g = p[6]
@@ -143,6 +143,9 @@ def set_params(opti: ca.Opti, T: ca.MX, p: ca.MX, tf: float):
     opti.set_value(T, tf)
 
     opti.set_value(q, ca.vertcat(0, 0, 0))
+    if rf is not None:
+        opti.set_value(q[1:], rf[1:])
+
     opti.set_value(w, ca.vertcat(2.53e-5, 0, 6.62e-5))
     opti.set_value(g, 3.71)
 
@@ -213,41 +216,57 @@ def solve_min_err(tf: float, min_err_x=None, min_err_dual=None):
                 'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
     opti.solve()
 
-    return opti.value(opti.f), opti.value(opti.x), opti.value(opti.lam_g)
+    rf = x[-1, 0:3]
+    return opti.value(opti.f), opti.value(rf), opti.value(opti.x), opti.value(opti.lam_g)
+
+
+class AcceptableSolution(Exception):
+    def __init__(self, t: float):
+        self.time = t
 
 
 def solve_min_err_and_time():
     tl = get_tl(2400, -10, 3.71, 2000, 1/5e-4, 0.8 * 24000)
     th = 3 * tl
+    cached_err = None
+    cached_rf = None
     cached_x = None
     cached_lam_g = None
 
     def to_opt(t: float):
+        nonlocal cached_err
+        nonlocal cached_rf
         nonlocal cached_x
         nonlocal cached_lam_g
         try:
-            result, cached_x, cached_lam_g = solve_min_err(
+            result, rf, cached_x, cached_lam_g = solve_min_err(
                 t, cached_x, cached_lam_g)
         except:
             result = math.inf
 
         print(t, result)
+        if cached_err is None or result < cached_err:
+            cached_err = result
+            cached_rf = rf
 
         if result < 1e-2:
-            raise StopIteration()
+            raise AcceptableSolution(result)
 
         return result
 
-    scipy.optimize.golden(to_opt, brack=(tl, th))
+    try:
+        return scipy.optimize.golden(to_opt, brack=(tl, th)), cached_rf
+    except AcceptableSolution as e:
+        return e.time, cached_rf
 
 
 min_fuel_state = min_fuel_landing_problem()
 
 
-def solve_min_fuel(tf: float, min_fuel_x=None, min_fuel_dual=None):
+def solve_min_fuel(tf: float, rf, min_fuel_x=None, min_fuel_dual=None):
     opti, T, x, u, p = min_fuel_state
 
-    set_params(opti, T, p, tf)
+    set_params(opti, T, p, tf, rf)
 
     if min_fuel_x is not None:
         opti.set_initial(opti.x, min_fuel_x)
@@ -267,8 +286,14 @@ def solve_min_fuel(tf: float, min_fuel_x=None, min_fuel_dual=None):
 
 
 def solve_min_fuel_and_time():
+    t_min_err, rf_min_err = solve_min_err_and_time()
+
     tl = get_tl(2400, -10, 3.71, 2000, 1/5e-4, 0.8 * 24000)
-    th = 3 * tl
+    # In the paper they bound the search from above by 3 * tl.
+    # This is really not necessary for us in practice, and hopping around such an extreme range hurts our solve time.
+    # Instead, we use scipy's nifty feature where you don't explicitly provide an upper bound. Maybe it doesn't provide
+    # the same guarantees on convergence though? Hard to say.
+    # th = 3 * tl
 
     cached_x = None
     cached_lam_g = None
@@ -277,11 +302,12 @@ def solve_min_fuel_and_time():
         nonlocal cached_x
         nonlocal cached_lam_g
         try:
-            result, cached_x, cached_lam_g = solve_min_fuel(t, cached_x)
+            result, cached_x, cached_lam_g = solve_min_fuel(
+                t, rf_min_err, cached_x)
         except:
             result = math.inf
 
         print(t, result)
         return result
 
-    scipy.optimize.golden(to_opt, brack=(tl, tl + 1, th), tol=0.01)
+    scipy.optimize.golden(to_opt, brack=(tl, tl + 1), tol=0.01)
