@@ -1,16 +1,24 @@
 import casadi as ca
+from dataclasses import dataclass, replace
+from functools import cache
 import math
+import numpy as np
+import numpy.typing as npt
 import scipy.optimize
-from typing import Tuple
+from typing import Optional, Tuple
 
 from sim import collocate
-from util import VarDict, Slice
+from util import VarDict, Slice, OptiProblem, OptiSol
 
 
 class State(VarDict):
     r = Slice[0:3]
     v = Slice[3:6]
     lnm = Slice[6]
+
+    @property
+    def m(self):
+        return ca.exp(self.lnm)
 
 
 class Control(VarDict):
@@ -32,7 +40,21 @@ class Params(VarDict):
     v0 = Slice[15:18]
 
 
-def skew_sym(x: ca.MX):
+@dataclass(frozen=True)
+class ParamSet:
+    q: npt.NDArray
+    w: npt.NDArray
+    g: float
+    min_thr: float
+    max_thr: float
+    ve: float
+    mw: float
+    md: float
+    r0: npt.NDArray
+    v0: npt.NDArray
+
+
+def skew_sym(x: ca.MX | ca.DM):
     return ca.vertcat(
         ca.horzcat(0, -x[2], x[1]),
         ca.horzcat(x[2], 0, -x[0]),
@@ -67,6 +89,8 @@ def base_landing_problem():
     u = Control(u, axis=1)
     p = Params(p)
 
+    problem = OptiProblem(opti, T, x, u, p)
+
     # (5) glide cone constraints (TODO implement)
 
     # (7) mass constraints
@@ -99,49 +123,58 @@ def base_landing_problem():
     # (19) thrust pointing
     opti.subject_to(u.acc[:, 0] >= 0)
 
-    return opti, T, x, u, p
+    return problem
 
 
+@cache
 def min_err_landing_problem():
-    opti, T, x, u, p = base_landing_problem()
+    result = base_landing_problem()
+    x = result.x
+    p = result.p
 
     err = x.r[-1, 1:] - p.q[1:].T
-    opti.minimize(err @ err.T)
+    result.opti.minimize(err @ err.T)
 
-    return opti, T, x, u, p
+    return result
 
 
+@cache
 def min_fuel_landing_problem():
-    opti, T, x, u, p = base_landing_problem()
+    result = base_landing_problem()
+    x = result.x
+    p = result.p
 
-    opti.subject_to(x.r[-1, 1:] == p.q[1:].T)
-    opti.minimize(-x.lnm[-1])
+    result.opti.subject_to(x.r[-1, 1:] == p.q[1:].T)
+    result.opti.minimize(-x.lnm[-1])
 
-    return opti, T, x, u, p
-
-
-def set_params(opti: ca.Opti, T: ca.MX, p: Params, tf: float, rf=None):
-    opti.set_value(T, tf)
-
-    opti.set_value(p.q, ca.vertcat(0, 0, 0))
-    if rf is not None:
-        opti.set_value(p.q[1:], rf[1:])
-
-    opti.set_value(p.w, ca.vertcat(2.53e-5, 0, 6.62e-5))
-    opti.set_value(p.g, 3.71)
-
-    opti.set_value(p.min_thr, 0.2 * 24000)
-    opti.set_value(p.max_thr, 0.8 * 24000)
-
-    opti.set_value(p.ve, 1 / 5e-4)
-    opti.set_value(p.mw, 2000)
-    opti.set_value(p.md, 300)
-
-    opti.set_value(p.r0, ca.vertcat(2400, 450, -330))
-    opti.set_value(p.v0, ca.vertcat(-10, -40, 10))
+    return result
 
 
-def get_tl(h0: float, v0: float, g: float, mw: float, ve: float, max_thr: float) -> float:
+def set_params(problem: OptiProblem[State, Control, Params], tf: float, param_set: ParamSet):
+    opti = problem.opti
+    p = problem.p
+
+    opti.set_value(problem.T, tf)
+
+    opti.set_value(p.q, param_set.q)
+    opti.set_value(p.w, param_set.w)
+    opti.set_value(p.g, param_set.g)
+    opti.set_value(p.min_thr, param_set.min_thr)
+    opti.set_value(p.max_thr, param_set.max_thr)
+    opti.set_value(p.ve, param_set.ve)
+    opti.set_value(p.mw, param_set.mw)
+    opti.set_value(p.md, param_set.md)
+    opti.set_value(p.r0, param_set.r0)
+    opti.set_value(p.v0, param_set.v0)
+
+
+def get_tl(param_set: ParamSet) -> float:
+    h0 = param_set.r0[0]
+    v0 = param_set.v0[0]
+    g = param_set.g
+    mw = param_set.mw
+    ve = param_set.ve
+    max_thr = param_set.max_thr
     k = max_thr / ve
 
     def hf(ts: float) -> Tuple[float, float]:
@@ -167,7 +200,6 @@ def get_tl(h0: float, v0: float, g: float, mw: float, ve: float, max_thr: float)
             return -g + k * ve / (mw - k * tburn)
 
         tau = scipy.optimize.newton(vf, x0=0, fprime=vfdot)
-        # tau = scipy.optimize.newton(vf, x0=0)
         return tau, hf(tau)  # type: ignore
 
     guess = (v0 + math.sqrt(v0**2 + 2 * h0 * g)) / g
@@ -176,27 +208,25 @@ def get_tl(h0: float, v0: float, g: float, mw: float, ve: float, max_thr: float)
     return hf(ts)[0]  # type: ignore
 
 
-min_err_state = min_err_landing_problem()
+def solve_min_err(tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = None):
+    problem = min_err_landing_problem()
+    opti = problem.opti
+    x = problem.x
+    u = problem.u
 
-
-def solve_min_err(tf: float, min_err_x=None, min_err_dual=None):
-    opti, T, x, u, p = min_err_state
-
-    set_params(opti, T, p, tf)
-    if min_err_x is not None:
-        opti.set_initial(opti.x, min_err_x)
-        if min_err_dual is not None:
-            opti.set_initial(opti.lam_g, min_err_dual)
-    else:
+    set_params(problem, tf, param_set)
+    if warm_sol is None:
+        # TODO provide a better initial guess using the closed-form solution for vertical-only coordinates.
         opti.set_initial(x.lnm, ca.log(2000))
         opti.set_initial(u.acc, 1)
+    else:
+        warm_sol.load(opti)
 
     opti.solver('ipopt', {'ipopt.sb': 'yes',
                 'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
     opti.solve()
 
-    rf = x.r[-1, :]
-    return opti.value(opti.f), opti.value(rf), opti.value(opti.x), opti.value(opti.lam_g)
+    return OptiSol.save(opti, x, u)
 
 
 class AcceptableSolution(Exception):
@@ -204,88 +234,106 @@ class AcceptableSolution(Exception):
         self.time = t
 
 
-def solve_min_err_and_time():
-    tl = get_tl(2400, -10, 3.71, 2000, 1/5e-4, 0.8 * 24000)
+def solve_min_err_and_time(param_set: ParamSet) -> Tuple[float, float]:
+    tl = get_tl(param_set)
     th = 3 * tl
-    cached_err = None
-    cached_rf = None
-    cached_x = None
-    cached_lam_g = None
+
+    sols = {}
+    warm_sol = None
 
     def to_opt(t: float):
-        nonlocal cached_err
-        nonlocal cached_rf
-        nonlocal cached_x
-        nonlocal cached_lam_g
+        nonlocal warm_sol
         try:
-            result, rf, cached_x, cached_lam_g = solve_min_err(
-                t, cached_x, cached_lam_g)
+            warm_sol = solve_min_err(t, param_set, warm_sol)
         except:
-            result = math.inf
-            rf = None
+            return math.inf
 
-        print(t, result)
-        if cached_err is None or result < cached_err:
-            cached_err = result
-            cached_rf = rf
+        rf = warm_sol.x.r[-1, :]
+        sols[t] = rf
+        print(t, rf)
 
-        if result < 1e-2:
-            raise AcceptableSolution(result)
+        rf = ca.norm_2(rf)
+        if rf < 1e-2:
+            raise AcceptableSolution(t)
 
-        return result
+        return rf
 
     try:
-        return scipy.optimize.golden(to_opt, brack=(tl, th)), cached_rf
+        time = scipy.optimize.golden(to_opt, brack=(tl, th))
+        return time, sols[time]  # type: ignore
     except AcceptableSolution as e:
-        return e.time, cached_rf
+        return e.time, sols[e.time]  # type: ignore
 
 
-min_fuel_state = min_fuel_landing_problem()
+def solve_min_fuel(tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = None):
+    problem = min_fuel_landing_problem()
+    opti = problem.opti
+    x = problem.x
+    u = problem.u
 
-
-def solve_min_fuel(tf: float, rf, min_fuel_x=None, min_fuel_dual=None):
-    opti, T, x, u, p = min_fuel_state
-
-    set_params(opti, T, p, tf, rf)
-
-    if min_fuel_x is not None:
-        opti.set_initial(opti.x, min_fuel_x)
-        if min_fuel_dual is not None:
-            opti.set_initial(opti.lam_g, min_fuel_dual)
-    else:
+    set_params(problem, tf, param_set)
+    if warm_sol is None:
         opti.set_initial(x.lnm, ca.log(2000))
         opti.set_initial(u.acc, 1)
+    else:
+        warm_sol.load(opti)
 
     opti.solver('ipopt', {'ipopt.sb': 'yes',
                 'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
     opti.solve()
 
-    return opti.value(opti.f), opti.value(opti.x), opti.value(opti.lam_g)
+    return OptiSol.save(opti, x, u)
 
 
-def solve_min_fuel_and_time():
-    t_min_err, rf_min_err = solve_min_err_and_time()
+def solve_min_fuel_and_time(param_set: ParamSet):
+    t_min_err, rf_min_err = solve_min_err_and_time(param_set)
+    param_set = replace(param_set, q=rf_min_err)
 
-    tl = get_tl(2400, -10, 3.71, 2000, 1/5e-4, 0.8 * 24000)
     # In the paper they bound the search from above by 3 * tl.
     # This is really not necessary for us in practice, and hopping around such an extreme range hurts our solve time.
     # Instead, we use scipy's nifty feature where you don't explicitly provide an upper bound. Maybe it doesn't provide
     # the same guarantees on convergence though? Hard to say.
     # th = 3 * tl
+    tl = get_tl(param_set)
 
-    cached_x = None
-    cached_lam_g = None
+    warm_sol = None
 
     def to_opt(t: float):
-        nonlocal cached_x
-        nonlocal cached_lam_g
+        nonlocal warm_sol
         try:
-            result, cached_x, cached_lam_g = solve_min_fuel(
-                t, rf_min_err, cached_x)
+            warm_sol = solve_min_fuel(t, param_set, warm_sol)
         except:
-            result = math.inf
+            return math.inf
 
-        print(t, result)
-        return result
+        print(t, warm_sol.x.lnm[-1])
+        return -warm_sol.x.lnm[-1]
 
-    scipy.optimize.golden(to_opt, brack=(tl, tl + 1), tol=0.01)
+    t = scipy.optimize.golden(to_opt, brack=(tl, tl + 1), tol=0.01)
+    return solve_min_fuel(t, param_set, warm_sol)  # type: ignore
+
+
+test_prob = ParamSet(
+    q=np.zeros(3),
+    w=np.array([2.53e-5, 0, 6.62e-5]),
+    g=3.71,
+    min_thr=0.2 * 24000,
+    max_thr=0.8 * 24000,
+    ve=2000,
+    mw=2000,
+    md=300,
+    r0=np.array([2400, 450, -330]),
+    v0=np.array([-10, -40, 10])
+)
+
+test_prob_2 = ParamSet(
+    q=np.zeros(3),
+    w=np.array([2.53e-5, 0, 6.62e-5]),
+    g=3.71,
+    min_thr=0.0 * 24000,
+    max_thr=1.0 * 24000,
+    ve=2000,
+    mw=2000,
+    md=300,
+    r0=np.array([2400, 450, -330]),
+    v0=np.array([-10, -40, 10])
+)
