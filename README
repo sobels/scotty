@@ -1,0 +1,31 @@
+# scotty
+scotty is a python project aiming to implement control algorithms for KSP / KSP2 vessels. For now, I'd like to implement:
+
+- Attitude control
+- Ascent
+- Rendezvous
+- Patched conics transfers
+- Retropropulsive landing
+
+...but I'm sure that list will grow. I plan to interface this to a running KSP instance over [kRPC](https://github.com/krpc/krpc), or whatever mod provides similar functionality for KSP2.
+
+## Implementation plans
+
+### Attitude control
+The idea is to use a quaternion feedback control as in [the LRO](https://ntrs.nasa.gov/api/citations/20080012716/downloads/20080012716.pdf), but absent the modifications necessary for nadir pointing during large angle slews. The feedback law can be stated,
+
+T = J (-k_r w_e - k_p a_e - k_i integral[a_e]) + w x J w
+
+Here, k_r, k_p, and k_i are scalar gains to be selected. w is the body angular momentum and J is the vessel moment of intertia. Finally, w_e is the error in angular velocity and a_e is the vector part of the attitude error quaternion. The integral term should only be used when a_e is small and ideally uses an anti-windup integration scheme. I don't know how to select the k_i gain, but it is easy to select k_p and k_r. Note that (k_p J)^-1 (k_r J) == k_r / k_p I > 0 when k_r and k_p share the same sign. So, pretty much any gains k_p and k_r will work so long as we properly avoid/mitigate torque clamping.
+
+### Ascent
+I think this will easily yield to NLP, possibly with powered explicit guidance in the terminal phase.
+
+### Rendezvous
+Ditto this
+
+### Patched conics transfers
+I have some old code lying around somewhere to handle maneuver nodes. This would be much harder if we had to do an N-body simulation.
+
+### Retropropulsive landing
+You can see my handiwork in landing.py. I use casadi to implement the approach in [this paper](http://www.larsblackmore.com/iee_tcst13.pdf). The code successfully reproduces the simulation in the paper. At some point I will implement better initial trajectory guesses and investigate MX -> SX conversion to speed up jacobian / hessian evaluations.
