@@ -1,8 +1,43 @@
 import casadi as ca
 import math
 import scipy.optimize
+from typing import Tuple
 
 from sim import collocate
+from util import VarDict, Slice
+
+
+class State(VarDict):
+    r = Slice[0:3]
+    v = Slice[3:6]
+    lnm = Slice[6]
+
+
+class Control(VarDict):
+    acc = Slice[0:3]
+    sigma = Slice[3]
+
+
+class Params(VarDict):
+    # TODO add thrust pointing and glide cone parameters, for now we'll hardcode acc[0] >= 0
+    q = Slice[0:3]
+    w = Slice[3:6]
+    g = Slice[6]
+    min_thr = Slice[7]
+    max_thr = Slice[8]
+    ve = Slice[9]
+    mw = Slice[10]
+    md = Slice[11]
+    r0 = Slice[12:15]
+    v0 = Slice[15:18]
+
+
+def skew_sym(x: ca.MX):
+    return ca.vertcat(
+        ca.horzcat(0, -x[2], x[1]),
+        ca.horzcat(x[2], 0, -x[0]),
+        ca.horzcat(-x[1], x[0], 0)
+    )
 
 
 def landing_dynamics():
@@ -10,85 +45,49 @@ def landing_dynamics():
 
     NOTE: coordinate system is surface fixed with first coordinate representing height."""
 
-    x = ca.MX.sym('x', 7)
-    r = x[0:3]
-    v = x[3:6]
-    lnm = x[6]
-
-    u = ca.MX.sym('u', 4)
-    acc = u[0:3]
-    sigma = u[3]
-
-    # TODO add thrust pointing and glide cone parameters, for now we'll hardcode acc[0] >= 0
-    p = ca.MX.sym('p', 18)
-    q = p[0:3]
-    w = p[3:6]
-    g = p[6]
-    min_thr = p[7]
-    max_thr = p[8]
-    ve = p[9]
-    mw = p[10]
-    md = p[11]
-    r0 = p[12:15]
-    v0 = p[15:18]
+    x = State(ca.MX.sym('x', 7))  # type: ignore
+    u = Control(ca.MX.sym('u', 4))  # type: ignore
+    p = Params(ca.MX.sym('p', 18))  # type: ignore
 
     i, j, k = ca.horzsplit(ca.MX_eye(3))
 
-    S = ca.horzcat(
-        ca.vertcat(0, w[2], -w[1]),
-        ca.vertcat(-w[2], 0, w[0]),
-        ca.vertcat(w[1], -w[0], 0)
-    )
+    wx = skew_sym(p.w)
 
-    rdot = v
-    vdot = -S @ S @ r - 2 * S @ v - g * i + acc
-    lnmdot = -sigma / ve
+    rdot = x.v
+    vdot = -wx @ wx @ x.r - 2 * wx @ x.v - p.g * i + u.acc
+    lnmdot = -u.sigma / p.ve
 
-    return ca.Function('xdot', [x, u, p], [ca.vertcat(rdot, vdot, lnmdot)])
+    return ca.Function('xdot', [x.var, u.var, p.var], [ca.vertcat(rdot, vdot, lnmdot)])
 
 
 def base_landing_problem():
     opti, T, x, u, p = collocate(landing_dynamics(), 20, 3)
 
-    r = x[:, 0:3]
-    v = x[:, 3:6]
-    lnm = x[:, 6]
-
-    acc = u[:, 0:3]
-    sigma = u[:, 3]
-
-    q = p[0:3]
-    w = p[3:6]
-    g = p[6]
-    min_thr = p[7]
-    max_thr = p[8]
-    ve = p[9]
-    mw = p[10]
-    md = p[11]
-    r0 = p[12:15]
-    v0 = p[15:18]
+    x = State(x, axis=1)
+    u = Control(u, axis=1)
+    p = Params(p)
 
     # (5) glide cone constraints (TODO implement)
 
     # (7) mass constraints
-    opti.subject_to(lnm[0] == ca.log(mw))
-    opti.subject_to(opti.bounded(ca.log(md), lnm[-1], ca.log(mw)))
+    opti.subject_to(x.lnm[0] == ca.log(p.mw))
+    opti.subject_to(opti.bounded(ca.log(p.md), x.lnm[-1], ca.log(p.mw)))
 
     # (8) and (9) boundary constraints on r, v
-    opti.subject_to(r[0, :] == r0.T)
-    opti.subject_to(v[0, :] == v0.T)
-    opti.subject_to(r[-1, 0] == q[0])
-    opti.subject_to(v[-1, :] == 0)
+    opti.subject_to(x.r[0, :] == p.r0.T)
+    opti.subject_to(x.v[0, :] == p.v0.T)
+    opti.subject_to(x.r[-1, 0] == p.q[0])
+    opti.subject_to(x.v[-1, :] == 0)
 
     # (18) thrust constraints
-    for i in range(u.shape[0]):
-        tot_acc = ca.norm_2(acc[i, :])
-        opti.subject_to(tot_acc <= sigma[i])
+    for i in range(u.var.shape[0]):
+        tot_acc = ca.norm_2(u.acc[i, :])
+        opti.subject_to(tot_acc <= u.sigma[i])
 
         opti.subject_to(opti.bounded(
-            min_thr * ca.exp(-lnm[i * 4]),
-            sigma[i],
-            max_thr * ca.exp(-lnm[i * 4])
+            p.min_thr * ca.exp(-x.lnm[i * 4]),
+            u.sigma[i],
+            p.max_thr * ca.exp(-x.lnm[i * 4])
         ))
         # zp = lnm[i * 4] - ca.log(mw - max_thr * i * T / 40 / ve)
         # opti.subject_to(opti.bounded(
@@ -98,7 +97,7 @@ def base_landing_problem():
         # ))
 
     # (19) thrust pointing
-    opti.subject_to(acc[:, 0] >= 0)
+    opti.subject_to(u.acc[:, 0] >= 0)
 
     return opti, T, x, u, p
 
@@ -106,10 +105,7 @@ def base_landing_problem():
 def min_err_landing_problem():
     opti, T, x, u, p = base_landing_problem()
 
-    r = x[:, 0:3]
-    q = p[0:3]
-
-    err = r[-1, 1:] - q[1:].T
+    err = x.r[-1, 1:] - p.q[1:].T
     opti.minimize(err @ err.T)
 
     return opti, T, x, u, p
@@ -118,81 +114,66 @@ def min_err_landing_problem():
 def min_fuel_landing_problem():
     opti, T, x, u, p = base_landing_problem()
 
-    r = x[:, 0:3]
-    lnm = x[:, 6]
-    q = p[0:3]
-
-    opti.subject_to(r[-1, 1:] == q[1:].T)
-    opti.minimize(-lnm[-1])
+    opti.subject_to(x.r[-1, 1:] == p.q[1:].T)
+    opti.minimize(-x.lnm[-1])
 
     return opti, T, x, u, p
 
 
-def set_params(opti: ca.Opti, T: ca.MX, p: ca.MX, tf: float, rf=None):
-    q = p[0:3]
-    w = p[3:6]
-    g = p[6]
-    min_thr = p[7]
-    max_thr = p[8]
-    ve = p[9]
-    mw = p[10]
-    md = p[11]
-    r0 = p[12:15]
-    v0 = p[15:18]
-
+def set_params(opti: ca.Opti, T: ca.MX, p: Params, tf: float, rf=None):
     opti.set_value(T, tf)
 
-    opti.set_value(q, ca.vertcat(0, 0, 0))
+    opti.set_value(p.q, ca.vertcat(0, 0, 0))
     if rf is not None:
-        opti.set_value(q[1:], rf[1:])
+        opti.set_value(p.q[1:], rf[1:])
 
-    opti.set_value(w, ca.vertcat(2.53e-5, 0, 6.62e-5))
-    opti.set_value(g, 3.71)
+    opti.set_value(p.w, ca.vertcat(2.53e-5, 0, 6.62e-5))
+    opti.set_value(p.g, 3.71)
 
-    opti.set_value(min_thr, 0.2 * 24000)
-    opti.set_value(max_thr, 0.8 * 24000)
+    opti.set_value(p.min_thr, 0.2 * 24000)
+    opti.set_value(p.max_thr, 0.8 * 24000)
 
-    opti.set_value(ve, 1 / 5e-4)
-    opti.set_value(mw, 2000)
-    opti.set_value(md, 300)
+    opti.set_value(p.ve, 1 / 5e-4)
+    opti.set_value(p.mw, 2000)
+    opti.set_value(p.md, 300)
 
-    opti.set_value(r0, ca.vertcat(2400, 450, -330))
-    opti.set_value(v0, ca.vertcat(-10, -40, 10))
+    opti.set_value(p.r0, ca.vertcat(2400, 450, -330))
+    opti.set_value(p.v0, ca.vertcat(-10, -40, 10))
 
 
-def get_tl(h0, v0, g, mw, ve, max_thr) -> float:
+def get_tl(h0: float, v0: float, g: float, mw: float, ve: float, max_thr: float) -> float:
     k = max_thr / ve
 
-    def hf(ts):
+    def hf(ts: float) -> Tuple[float, float]:
         hts = -0.5 * g * ts**2 + ts * v0 + h0
         vts = -g * ts + v0
 
-        def tburn(tau):
+        def tburn(tau: float):
             return tau - ts
 
-        def dv(tau):
+        def dv(tau: float):
             return math.log(mw / (mw - k * tburn(tau)))
 
-        def hf(tau):
+        def hf(tau: float):
             tburn = tau - ts
             return hts + tburn * vts - 0.5 * g * tburn**2 + ve * (tburn + (tburn - mw/k) * dv(tau))
 
-        def vf(tau):
+        def vf(tau: float):
             tburn = tau - ts
             return vts - g * tburn + ve * dv(tau)
 
-        def vfdot(tau):
+        def vfdot(tau: float):
             tburn = tau - ts
             return -g + k * ve / (mw - k * tburn)
 
         tau = scipy.optimize.newton(vf, x0=0, fprime=vfdot)
         # tau = scipy.optimize.newton(vf, x0=0)
-        return tau, hf(tau)
+        return tau, hf(tau)  # type: ignore
 
     guess = (v0 + math.sqrt(v0**2 + 2 * h0 * g)) / g
     ts = scipy.optimize.newton(lambda ts: hf(ts)[1], x0=guess)
 
-    return hf(ts)[0]
+    return hf(ts)[0]  # type: ignore
 
 
 min_err_state = min_err_landing_problem()
@@ -207,16 +188,14 @@ def solve_min_err(tf: float, min_err_x=None, min_err_dual=None):
         if min_err_dual is not None:
             opti.set_initial(opti.lam_g, min_err_dual)
     else:
-        acc = u[:, 0:3]
-        lnm = x[:, 6]
-        opti.set_initial(lnm, ca.log(2000))
-        opti.set_initial(acc, 1)
+        opti.set_initial(x.lnm, ca.log(2000))
+        opti.set_initial(u.acc, 1)
 
     opti.solver('ipopt', {'ipopt.sb': 'yes',
                 'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
     opti.solve()
 
-    rf = x[-1, 0:3]
+    rf = x.r[-1, :]
     return opti.value(opti.f), opti.value(rf), opti.value(opti.x), opti.value(opti.lam_g)
 
 
@@ -243,6 +222,7 @@ def solve_min_err_and_time():
                 t, cached_x, cached_lam_g)
         except:
             result = math.inf
+            rf = None
 
         print(t, result)
         if cached_err is None or result < cached_err:
@@ -273,10 +253,8 @@ def solve_min_fuel(tf: float, rf, min_fuel_x=None, min_fuel_dual=None):
         if min_fuel_dual is not None:
             opti.set_initial(opti.lam_g, min_fuel_dual)
     else:
-        acc = u[:, 0:3]
-        lnm = x[:, 6]
-        opti.set_initial(lnm, ca.log(2000))
-        opti.set_initial(acc, 1)
+        opti.set_initial(x.lnm, ca.log(2000))
+        opti.set_initial(u.acc, 1)
 
     opti.solver('ipopt', {'ipopt.sb': 'yes',
                 'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})

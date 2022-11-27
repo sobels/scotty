@@ -36,7 +36,7 @@ def collocate(dynamics: ca.Function, N: int, d: int):
         # Derivative constraint: the polynomial must have a derivative equal to the given dynamics
         xp = C.T @ xc
         fj = ca.vertcat(
-            *(dynamics(xc[j + 1, :].T, u[k, :].T, p).T for j in range(d)))
+            *(dynamics(xc[j + 1, :].T, u[k, :].T, p).T for j in range(d)))  # type: ignore
         opti.subject_to(h * fj == xp)
 
         # Continuity constraint: the polynomial formed by the first `d` points must evaluate to the next point
