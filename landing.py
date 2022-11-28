@@ -79,7 +79,7 @@ def landing_dynamics():
     vdot = -wx @ wx @ x.r - 2 * wx @ x.v - p.g * i + u.acc
     lnmdot = -u.sigma / p.ve
 
-    return ca.Function('xdot', [x.var, u.var, p.var], [ca.vertcat(rdot, vdot, lnmdot)])
+    return ca.Function('xdot', [x.var, u.var, p.var], [ca.vertcat(rdot, vdot, lnmdot)]).expand()
 
 
 def base_landing_problem():
@@ -142,10 +142,13 @@ def min_err_landing_problem():
 def min_fuel_landing_problem():
     result = base_landing_problem()
     x = result.x
+    u = result.u
     p = result.p
 
     result.opti.subject_to(x.r[-1, 1:] == p.q[1:].T)
-    result.opti.minimize(-x.lnm[-1])
+
+    # While we could directly state to maximize the final mass, this equivalent condition greatly improves solver perf.
+    result.opti.minimize(ca.sum1(u.sigma))
 
     return result
 
@@ -208,8 +211,7 @@ def get_tl(param_set: ParamSet) -> float:
     return hf(ts)[0]  # type: ignore
 
 
-def solve_min_err(tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = None):
-    problem = min_err_landing_problem()
+def solve_problem(problem: OptiProblem[State, Control, Params], tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = None, warm=False):
     opti = problem.opti
     x = problem.x
     u = problem.u
@@ -222,11 +224,19 @@ def solve_min_err(tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = 
     else:
         warm_sol.load(opti)
 
-    opti.solver('ipopt', {'ipopt.sb': 'yes',
-                'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
-    opti.solve()
+    opti.solver('ipopt', {
+        'print_time': False,
+        'ipopt.sb': 'yes',
+        'ipopt.print_level': 0,
+        'ipopt.warm_start_init_point': 'yes' if warm else 'no',
+        'ipopt.warm_start_bound_frac': 1e-16,
+        'ipopt.warm_start_bound_push': 1e-16,
+        'ipopt.warm_start_mult_bound_push': 1e-16,
+        'ipopt.warm_start_slack_bound_frac': 1e-16,
+        'ipopt.warm_start_slack_bound_push': 1e-16
+    })
 
-    return OptiSol.save(opti, x, u)
+    return OptiSol.save(opti.solve(), x, u)
 
 
 class AcceptableSolution(Exception):
@@ -235,6 +245,7 @@ class AcceptableSolution(Exception):
 
 
 def solve_min_err_and_time(param_set: ParamSet) -> Tuple[float, float]:
+    problem = min_err_landing_problem()
     tl = get_tl(param_set)
     th = 3 * tl
 
@@ -244,13 +255,12 @@ def solve_min_err_and_time(param_set: ParamSet) -> Tuple[float, float]:
     def to_opt(t: float):
         nonlocal warm_sol
         try:
-            warm_sol = solve_min_err(t, param_set, warm_sol)
+            warm_sol = solve_problem(problem, t, param_set, warm_sol)
         except:
             return math.inf
 
         rf = warm_sol.x.r[-1, :]
         sols[t] = rf
-        print(t, rf)
 
         rf = ca.norm_2(rf)
         if rf < 1e-2:
@@ -265,27 +275,8 @@ def solve_min_err_and_time(param_set: ParamSet) -> Tuple[float, float]:
         return e.time, sols[e.time]  # type: ignore
 
 
-def solve_min_fuel(tf: float, param_set: ParamSet, warm_sol: Optional[OptiSol] = None):
-    problem = min_fuel_landing_problem()
-    opti = problem.opti
-    x = problem.x
-    u = problem.u
-
-    set_params(problem, tf, param_set)
-    if warm_sol is None:
-        opti.set_initial(x.lnm, ca.log(2000))
-        opti.set_initial(u.acc, 1)
-    else:
-        warm_sol.load(opti)
-
-    opti.solver('ipopt', {'ipopt.sb': 'yes',
-                'ipopt.print_level': 0, 'ipopt.suppress_all_output': 'yes'})
-    opti.solve()
-
-    return OptiSol.save(opti, x, u)
-
-
 def solve_min_fuel_and_time(param_set: ParamSet):
+    problem = min_fuel_landing_problem()
     t_min_err, rf_min_err = solve_min_err_and_time(param_set)
     param_set = replace(param_set, q=rf_min_err)
 
@@ -301,15 +292,14 @@ def solve_min_fuel_and_time(param_set: ParamSet):
     def to_opt(t: float):
         nonlocal warm_sol
         try:
-            warm_sol = solve_min_fuel(t, param_set, warm_sol)
+            warm_sol = solve_problem(problem, t, param_set, warm_sol)
         except:
             return math.inf
 
-        print(t, warm_sol.x.lnm[-1])
         return -warm_sol.x.lnm[-1]
 
     t = scipy.optimize.golden(to_opt, brack=(tl, tl + 1), tol=0.01)
-    return solve_min_fuel(t, param_set, warm_sol)  # type: ignore
+    return solve_problem(problem, t, param_set, warm_sol)  # type: ignore
 
 
 test_prob = ParamSet(

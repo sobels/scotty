@@ -48,18 +48,20 @@ class OptiProblem(Generic[X, U, P]):
 
 @dataclass(frozen=True)
 class OptiSol(Generic[X, U]):
+    sol: ca.OptiSol
     xup: ca.DM
     lam_g: ca.DM
     x: X
     u: U
 
     @classmethod
-    def save(cls, opti: ca.Opti, x: X, u: U):
+    def save(cls, sol: ca.OptiSol, x: X, u: U):
         return cls(
-            xup=opti.value(opti.x),
-            lam_g=opti.value(opti.lam_g),
-            x=x.__class__(opti.value(x.var), axis=x.axis),
-            u=u.__class__(opti.value(u.var), axis=u.axis)
+            sol=sol,
+            xup=sol.value(sol.opti.x),
+            lam_g=sol.value(sol.opti.lam_g),
+            x=x.__class__(sol.value(x.var), axis=x.axis),
+            u=u.__class__(sol.value(u.var), axis=u.axis)
         )
 
     def load(self, opti: ca.Opti):
