@@ -2,13 +2,12 @@ import casadi as ca
 from dataclasses import dataclass, replace
 from functools import cache
 import math
-import numpy as np
 import numpy.typing as npt
 import scipy.optimize
 from typing import Optional, Tuple
 
-from sim import collocate
-from util import VarDict, Slice, OptiProblem, OptiSol
+from .sim import collocate
+from .util import VarDict, Slice, OptiProblem, OptiSol
 
 
 class State(VarDict):
@@ -109,15 +108,20 @@ def base_landing_problem():
         opti.subject_to(tot_acc <= u.sigma[i])
 
         opti.subject_to(opti.bounded(
-            p.min_thr * ca.exp(-x.lnm[i * 4]),
+            p.min_thr / x.m[i * 4],
             u.sigma[i],
-            p.max_thr * ca.exp(-x.lnm[i * 4])
+            p.max_thr / x.m[i * 4]
         ))
-        # zp = lnm[i * 4] - ca.log(mw - max_thr * i * T / 40 / ve)
+
+        # This second-order cone approximation is suggested by the paper, but for some reason it makes convergence more
+        # difficult for this code.
+        #
+        # z0 = ca.log(p.mw - p.max_thr * i * 4 * T / (x.var.shape[0] - 1) / p.ve)
+        # zp = x.lnm[i * 4] - z0
         # opti.subject_to(opti.bounded(
-        #     min_thr / mw * (1 - zp + 0.5 * zp**2),
-        #     sigma[i],
-        #     max_thr / mw * (1 - zp)
+        #     p.min_thr * ca.exp(-z0) * (1 - zp + 0.5 * zp**2),
+        #     u.sigma[i],
+        #     p.max_thr * ca.exp(-z0) * (1 - zp)
         # ))
 
     # (19) thrust pointing
@@ -300,30 +304,3 @@ def solve_min_fuel_and_time(param_set: ParamSet):
 
     t = scipy.optimize.golden(to_opt, brack=(tl, tl + 1), tol=0.01)
     return solve_problem(problem, t, param_set, warm_sol)  # type: ignore
-
-
-test_prob = ParamSet(
-    q=np.zeros(3),
-    w=np.array([2.53e-5, 0, 6.62e-5]),
-    g=3.71,
-    min_thr=0.2 * 24000,
-    max_thr=0.8 * 24000,
-    ve=2000,
-    mw=2000,
-    md=300,
-    r0=np.array([2400, 450, -330]),
-    v0=np.array([-10, -40, 10])
-)
-
-test_prob_2 = ParamSet(
-    q=np.zeros(3),
-    w=np.array([2.53e-5, 0, 6.62e-5]),
-    g=3.71,
-    min_thr=0.0 * 24000,
-    max_thr=1.0 * 24000,
-    ve=2000,
-    mw=2000,
-    md=300,
-    r0=np.array([2400, 450, -330]),
-    v0=np.array([-10, -40, 10])
-)

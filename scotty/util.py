@@ -1,6 +1,5 @@
 import casadi as ca
 from dataclasses import dataclass, field
-import numpy.typing as npt
 from typing import Generic, TypeVar
 
 
