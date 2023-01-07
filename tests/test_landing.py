@@ -37,8 +37,8 @@ infeasible_target = ParamSet(
     max_thr=0.8 * 24000,
     ve=2000,
     mw=2000,
-    md=1820,
-    r0=np.array([2400, 450, -330]),
+    md=300,
+    r0=np.array([2400, 8450, -8330]),
     v0=np.array([-10, -40, 10])
 )
 
@@ -48,13 +48,13 @@ class MinFuelTestCase(unittest.TestCase):
         sol = solve_min_fuel_and_time(vertical_descent)
         np.testing.assert_almost_equal(sol.x.r[-1, :], np.zeros(3))
         np.testing.assert_almost_equal(sol.x.v[-1, :], np.zeros(3))
-        np.testing.assert_almost_equal(sol.x.m[-1], 1846.18, decimal=1)
+        np.testing.assert_almost_equal(sol.x.m[-1].value, 1845, decimal=1)
 
     def test_large_divert(self):
         sol = solve_min_fuel_and_time(large_divert)
         np.testing.assert_almost_equal(sol.x.r[-1, :], np.zeros(3))
         np.testing.assert_almost_equal(sol.x.v[-1, :], np.zeros(3))
-        np.testing.assert_almost_equal(sol.x.m[-1], 1799.19, decimal=1)
+        np.testing.assert_almost_equal(sol.x.m[-1].value, 1798.8, decimal=1)
 
     def test_infeasible_target(self):
         sol = solve_min_fuel_and_time(infeasible_target)

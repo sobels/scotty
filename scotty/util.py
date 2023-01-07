@@ -1,21 +1,28 @@
-import casadi as ca
+from cvxpy.expressions.expression import Expression
+from cvxpy.expressions.constants.parameter import Parameter
 from dataclasses import dataclass, field
+import numpy.typing as npt
 from typing import Generic, TypeVar
 
+T = TypeVar("T", Expression, npt.NDArray)
+
 
 @dataclass(frozen=True)
-class VarDict:
-    var: ca.MX | ca.DM
+class VarDict(Generic[T]):
+    var: T
     axis: int = field(default=0)
 
+    @classmethod
+    def width(cls):
+        return max(f.indices.stop if isinstance(f.indices, slice) else f.indices + 1 for _, f in vars(cls).items() if isinstance(f, Var))
+
 
 @dataclass(frozen=True)
-class Var:
+class Var(Generic[T]):
     indices: slice | int
 
-    def __get__(self, obj: VarDict, obj_type=None) -> ca.MX | ca.DM:
+    def __get__(self, obj: VarDict[T], obj_type=None) -> T:
         dims = len(obj.var.shape)
-        assert dims == 2
 
         key = (slice(None), ) * obj.axis + (self.indices, ) + \
             (slice(None), ) * (dims - obj.axis - 1)
@@ -31,38 +38,15 @@ class SliceMeta:
 Slice = SliceMeta()
 
 
-X = TypeVar('X', bound=VarDict)
-U = TypeVar('U', bound=VarDict)
-P = TypeVar('P', bound=VarDict)
+X = TypeVar('X', bound=VarDict, covariant=True)
+U = TypeVar('U', bound=VarDict, covariant=True)
+P = TypeVar('P', bound=VarDict, covariant=True)
 
 
-@dataclass(frozen=True)
-class OptiProblem(Generic[X, U, P]):
-    opti: ca.Opti
-    T: ca.MX
+@dataclass
+class OptiVars(Generic[X, U, P]):
+    T: Parameter
+    Tinv: Parameter
     x: X
     u: U
     p: P
-
-
-@dataclass(frozen=True)
-class OptiSol(Generic[X, U]):
-    sol: ca.OptiSol
-    xup: ca.DM
-    lam_g: ca.DM
-    x: X
-    u: U
-
-    @classmethod
-    def save(cls, sol: ca.OptiSol, x: X, u: U):
-        return cls(
-            sol=sol,
-            xup=sol.value(sol.opti.x),
-            lam_g=sol.value(sol.opti.lam_g),
-            x=x.__class__(sol.value(x.var), axis=x.axis),
-            u=u.__class__(sol.value(u.var), axis=u.axis)
-        )
-
-    def load(self, opti: ca.Opti):
-        opti.set_initial(opti.x, self.xup)
-        opti.set_initial(opti.lam_g, self.lam_g)
